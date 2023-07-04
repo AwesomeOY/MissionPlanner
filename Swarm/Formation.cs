@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using GeoAPI.CoordinateSystems;
 using GeoAPI.CoordinateSystems.Transformations;
 using Vector3 = MissionPlanner.Utilities.Vector3;
+using netDxf.Entities;
 
 namespace MissionPlanner.Swarm
 {
@@ -21,6 +22,8 @@ namespace MissionPlanner.Swarm
             new Dictionary<MAVState, Tuple<PID, PID, PID, PID>>();
 
         private PointLatLngAlt masterpos = new PointLatLngAlt();
+        private PointLatLngAlt oldmasterpos = null;
+        private int masterpos_last_time_s = 0;
 
         public void setOffsets(MAVState mav, double x, double y, double z)
         {
@@ -80,6 +83,19 @@ namespace MissionPlanner.Swarm
                         continue;
 
                     PointLatLngAlt target = new PointLatLngAlt(masterpos);
+                    if (oldmasterpos == null)
+                    {
+                        oldmasterpos = new PointLatLngAlt(masterpos);
+                        return;
+                    }
+
+                    bool hasMaster = false;
+                    if (oldmasterpos.GetDistance(masterpos) > 4.0f)
+                    {
+                        masterpos_last_time_s = DateTime.Now.toUnixTime();
+                        oldmasterpos = new PointLatLngAlt(masterpos);
+                        hasMaster = true;
+                    }
 
                     try
                     {
@@ -113,184 +129,93 @@ namespace MissionPlanner.Swarm
                         target.Lng = point[0];
                         target.Alt += ((Vector3)offsets[mav]).z;
 
+                        // ArduPlane Type
                         if (mav.cs.firmware == Firmwares.ArduPlane)
                         {
-                            // get distance from target position
-                            var dist = target.GetDistance(mav.cs.Location);
-
-                            // get bearing to target
-                            var targyaw = mav.cs.Location.GetBearing(target);
-
-                            var targettrailer = target.newpos(Leader.cs.yaw, Math.Abs(dist) * -0.25);
-                            var targetleader = target.newpos(Leader.cs.yaw, 10 + dist);
-
-                            var yawerror = wrap_180(targyaw - mav.cs.yaw);
-                            var mavleadererror = wrap_180(Leader.cs.yaw - mav.cs.yaw);
-
-                            if (dist < 100)
+                            double targetyaw = 0.0f;
+                            double targetspeed = 0.0f;
+                            double dist = 0.0f;
+                            int err_time = DateTime.Now.toUnixTime() - masterpos_last_time_s;
+                            if (hasMaster || err_time < 2)
                             {
-                                targyaw = mav.cs.Location.GetBearing(targetleader);
-                                yawerror = wrap_180(targyaw - mav.cs.yaw);
+                                // get distance from target position
+                                dist = target.GetDistance(mav.cs.Location);
 
-                                var targBearing = mav.cs.Location.GetBearing(target);
-
-                                // check the bearing for the leader and target are within 45 degrees.
-                                if (Math.Abs(wrap_180(targBearing - targyaw)) > 45)
-                                    dist *= -1;
-                            }
-                            else
-                            {
-                                targyaw = mav.cs.Location.GetBearing(targettrailer);
-                                yawerror = wrap_180(targyaw - mav.cs.yaw);
-                            }
-
-                            // display update
-                            mav.GuidedMode.x = (int)(target.Lat * 1e7);
-                            mav.GuidedMode.y = (int)(target.Lng * 1e7);
-                            mav.GuidedMode.z = (float)target.Alt;
-
-                            MAVLink.mavlink_set_attitude_target_t att_target = new MAVLink.mavlink_set_attitude_target_t();
-                            att_target.target_system = mav.sysid;
-                            att_target.target_component = mav.compid;
-                            att_target.type_mask = 0xff;
-
-                            Tuple<PID, PID, PID, PID> pid;
-
-                            if (pids.ContainsKey(mav))
-                            {
-                                pid = pids[mav];
-                            }
-                            else
-                            {
-                                pid = new Tuple<PID, PID, PID, PID>(
-                                    new PID(1f, .03f, 0.02f, 10, 20, 0.1f, 0),
-                                    new PID(1f, .03f, 0.02f, 10, 20, 0.1f, 0),
-                                    new PID(1, 0, 0.00f, 15, 20, 0.1f, 0),
-                                    new PID(0.01f, 0.001f, 0, 0.5f, 20, 0.1f, 0));
-                                pids.Add(mav, pid);
-                            }
-
-                            var rollp = pid.Item1;
-                            var pitchp = pid.Item2;
-                            var yawp = pid.Item3;
-                            var thrustp = pid.Item4;
-
-                            var newroll = 0d;
-                            var newpitch = 0d;
-
-                            if (true)
-                            {
-                                var altdelta = target.Alt - mav.cs.alt;
-                                newpitch = altdelta;
-                                att_target.type_mask -= 0b00000010;
-
-                                pitchp.set_input_filter_all((float)altdelta);
-
-                                newpitch = pitchp.get_pid();
-                            }
-
-                            if (true)
-                            {
-                                var leaderturnrad = Leader.cs.radius;
-                                var mavturnradius = leaderturnrad - x;
-
+                                // get bearing to target
+                                var targyaw = mav.cs.Location.GetBearing(target);
+                                if (err_time >= 1 && Math.Abs(targyaw-Leader.cs.yaw)>=5.0f)
                                 {
-                                    var distToTarget = mav.cs.Location.GetDistance(target);
-                                    var bearingToTarget = mav.cs.Location.GetBearing(target);
-
-                                    // bearing stability
-                                    if (distToTarget < 30)
-                                        bearingToTarget = mav.cs.Location.GetBearing(targetleader);
-                                    // fly in from behind
-                                    if (distToTarget > 100)
-                                        bearingToTarget = mav.cs.Location.GetBearing(targettrailer);
-
-                                    var bearingDelta = wrap_180(bearingToTarget - mav.cs.yaw);
-                                    var tangent90 = bearingDelta > 0 ? 90 : -90;
-
-                                    newroll = 0;
-
-                                    // if the delta is > 90 then we are facing the wrong direction
-                                    if (Math.Abs(bearingDelta) < 85)
-                                    {
-                                        var insideAngle = Math.Abs(tangent90 - bearingDelta);
-                                        var angleCenter = 180 - insideAngle * 2;
-
-                                        // sine rule
-                                        var sine1 = Math.Max(distToTarget, 40) /
-                                                    Math.Sin(angleCenter * MathHelper.deg2rad);
-                                        var radius = sine1 * Math.Sin(insideAngle * MathHelper.deg2rad);
-
-                                        // average calced + leader offset turnradius - acts as a FF
-                                        radius = (Math.Abs(radius) + Math.Abs(mavturnradius)) / 2;
-
-                                        var angleBank = ((mav.cs.groundspeed * mav.cs.groundspeed) / radius) / 9.8;
-
-                                        angleBank *= MathHelper.rad2deg;
-
-                                        if (bearingDelta > 0)
-                                            newroll = Math.Abs(angleBank);
-                                        else
-                                            newroll = -Math.Abs(angleBank);
-                                    }
-
-                                    newroll += MathHelper.constrain(bearingDelta, -20, 20);
+                                    targyaw = Leader.cs.yaw;
                                 }
 
-                                // tr = gs2 / (9.8 * x)
-                                // (9.8 * x) * tr = gs2
-                                // 9.8 * x = gs2 / tr
-                                // (gs2/tr)/9.8 = x
+                                Tuple<PID> pid;
 
-                                var angle = ((mav.cs.groundspeed * mav.cs.groundspeed) / mavturnradius) / 9.8;
+                                if (pids.ContainsKey(mav))
+                                {
+                                    pid = pids[mav];
+                                }
+                                else
+                                {
+                                    pid = new Tuple<PID>(new PID(0.55f, 1.0f, 0f, 10, 20, 8, 0));
+                                    pids.Add(mav, pid);
+                                }
+                                var speedp = pid.Item1;
 
-                                //newroll = angle * MathHelper.rad2deg;
-
-                                // 1 degree of roll for ever 1 degree of yaw error
-                                //newroll += MathHelper.constrain(yawerror, -20, 20);
-
-                                //rollp.set_input_filter_all((float)yawdelta);
-                            }
-
-                            // do speed
-                            if (true)
-                            {
-                                //att_target.thrust = (float) MathHelper.mapConstrained(dist, 0, 40, 0, 1);
-                                att_target.type_mask -= 0b01000000;
-
+                                // do speed
                                 // in m out 0-1
-                                thrustp.set_input_filter_all((float)dist);
+                                speedp.set_input_filter_all((float)dist);
 
                                 // prevent buildup prior to being close
-                                if (dist > 40)
-                                    thrustp.reset_I();
+                                if (dist > 55)
+                                    speedp.reset_I();
 
-                                // 0.1 demand + pid results
-                                att_target.thrust = (float)MathHelper.constrain(thrustp.get_pid(), 0.1, 1);
+                                // 15m/s demand + pid results
+                                float target_speed = (float)MathHelper.constrain(speedp.get_pid(), 15, 35);
+                            }
+                            else
+                            {
+                                targetyaw = Leader.cs.yaw;
+                                target.Alt = mav.cs.alt;
+                                if (err_time <= 5)
+                                {
+                                    targetspeed = 15;
+                                    Console.WriteLine("OUTTIME Speed {1}", targetspeed);
+                                }
+                                else
+                                {
+                                    Console.WriteLine("OUTTIME Return");
+                                    return;
+                                }
                             }
 
-                            Quaternion q = new Quaternion();
-                            q.from_vector312(newroll * MathHelper.deg2rad, newpitch * MathHelper.deg2rad, yawerror * MathHelper.deg2rad);
+                            Console.WriteLine("sysid {0} - yaw {1} speed {2} dist {3}", mav.sysid, targetyaw, target_speed, dist);
 
-                            att_target.q = new float[4];
-                            att_target.q[0] = (float)q.q1;
-                            att_target.q[1] = (float)q.q2;
-                            att_target.q[2] = (float)q.q3;
-                            att_target.q[3] = (float)q.q4;
+                            //Yaw, Speed, Alt
+                            port.sendPacket(new MAVLink.mavlink_command_long_t {
+                                            command = (ushort)MAVLink.MAV_CMD.GUIDED_CHANGE_HEADING,
+                                            param1 = (float)MAVLink.HEADING_TYPE.COURSE_OVER_GROUND,
+                                            param2 = (float)targetyaw,
+                                            param3 = 0.0f
+                                            },
+                                            mav.sysid, mav.compid);
 
-                            //0b0= rpy
-                            att_target.type_mask -= 0b10000101;
-                            //att_target.type_mask -= 0b10000100;
+                            port.sendPacket(new MAVLink.mavlink_command_long_t {
+                                            command = (ushort)MAVLink.MAV_CMD.GUIDED_CHANGE_SPEED,
+                                            param1 = (float)MAVLink.SPEED_TYPE.GROUNDSPEED,
+                                            param2 = targetspeed,
+                                            param3 = 0.0f
+                                            },
+                                            mav.sysid, mav.compid);
 
-                            Console.WriteLine("sysid {0} - {1} dist {2} r {3} p {4} y {5}", mav.sysid,
-                                att_target.thrust, dist, newroll, newpitch, (targyaw - mav.cs.yaw));
-
-                            /*  Console.WriteLine("rpyt {0} {1} {2} {3} I {4} {5} {6} {7}",
-                                  rollp.get_pid(), pitchp.get_pid(), yawp.get_pid(), thrustp.get_pid(),
-                                  rollp.get_i(), pitchp.get_i(), yawp.get_i(), thrustp.get_i());
-                                  */
-                            port.sendPacket(att_target, mav.sysid, mav.compid);
+                            port.sendPacket(new MAVLink.mavlink_command_long_t {
+                                            command = (ushort)MAVLink.MAV_CMD.GUIDED_CHANGE_ALTITUDE,
+                                            param3 = 0.0f,
+                                            param7 = (float)target.Alt,
+                                            },
+                                            mav.sysid, mav.compid);
                         }
+                        // end ArduPlane
+
                         else
                         {
                             Vector3 vel = new Vector3(Leader.cs.vx, Leader.cs.vy, Leader.cs.vz);
